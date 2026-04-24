@@ -1072,10 +1072,108 @@ async def handle_upload_with_feedback(files, dialog, table):
     asyncio.create_task(_upload())
 
 
+def get_transcriber_options() -> dict:
+    default_models_by_language = {
+        language: settings.WHISPER_MODELS[:] for language in settings.WHISPER_LANGUAGES
+    }
+    default_default_model_by_language = {
+        language: settings.WHISPER_MODELS[0] for language in settings.WHISPER_LANGUAGES
+    }
+
+    default_options = {
+        "model_picker_enabled": False,
+        "languages": settings.WHISPER_LANGUAGES,
+        "models_by_language": default_models_by_language,
+        "default_model_by_language": default_default_model_by_language,
+    }
+
+    try:
+        response = httpx.get(
+            f"{settings.API_URL}/api/v1/transcriber/options",
+            headers=get_auth_header(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result", {})
+
+        if not isinstance(result, dict):
+            return default_options
+
+        languages = result.get("languages", default_options["languages"])
+        models_by_language = result.get(
+            "models_by_language",
+            default_options["models_by_language"],
+        )
+        default_model_by_language = result.get(
+            "default_model_by_language",
+            default_options["default_model_by_language"],
+        )
+
+        if not isinstance(languages, list):
+            languages = default_options["languages"]
+
+        if not isinstance(models_by_language, dict):
+            models_by_language = default_options["models_by_language"]
+
+        if not isinstance(default_model_by_language, dict):
+            default_model_by_language = default_options[
+                "default_model_by_language"
+            ]
+
+        return {
+            "model_picker_enabled": bool(result.get("model_picker_enabled", False)),
+            "languages": languages,
+            "models_by_language": models_by_language,
+            "default_model_by_language": default_model_by_language,
+        }
+    except Exception:
+        return default_options
+
+
+def resolve_language_and_model_selection(
+    language: str,
+    model_label: str | None,
+) -> tuple[str, str | None]:
+    if model_label and model_label.endswith(" [verbatim]"):
+        return f"{language} (verbatim)", model_label.removesuffix(" [verbatim]")
+
+    return language, model_label
+
+
+    try:
+        response = httpx.get(
+            f"{settings.API_URL}/api/v1/transcriber/options",
+            headers=get_auth_header(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json().get("result", {})
+
+        if not isinstance(result, dict):
+            return default_options
+
+        return {
+            "model_picker_enabled": bool(result.get("model_picker_enabled", False)),
+            "languages": result.get("languages", default_options["languages"]),
+            "models_by_language": result.get(
+                "models_by_language", default_options["models_by_language"]
+            ),
+            "default_model_by_language": result.get(
+                "default_model_by_language",
+                default_options["default_model_by_language"],
+            ),
+        }
+    except httpx.HTTPError:
+        return default_options
+
+
 def table_transcribe(selected_row, on_complete=None) -> None:
     """
     Handle the click event on the Transcribe button.
     """
+    options = get_transcriber_options()
+
     with ui.dialog() as dialog:
         with (
             ui.card()
@@ -1096,23 +1194,39 @@ def table_transcribe(selected_row, on_complete=None) -> None:
                 with ui.column().classes("col-12 col-sm-24"):
                     ui.label("Language").classes("text-subtitle2 q-mb-sm")
                     language = ui.select(
-                        settings.WHISPER_LANGUAGES,
-                        value=settings.WHISPER_LANGUAGES[0],
+                        options["languages"],
+                        value=options["languages"][0],
                     ).classes("w-full")
 
-                with ui.column().classes("col-12 col-sm-24") as verbatim_container:
-                    verbatim = ui.checkbox(
-                        "Verbatim (include filler words, repetitions and unfinished sentences)"
-                    ).classes("q-mt-sm")
-                    verbatim_container.set_visibility(
-                        language.value.lower() == "swedish"
-                    )
-                    language.on_value_change(
-                        lambda e: verbatim_container.set_visibility(
-                            e.value.lower() == "swedish"
-                            or e.value.lower() == "norwegian"
+                model = None
+                if options["model_picker_enabled"]:
+                    with ui.column().classes("col-12 col-sm-24"):
+                        ui.label("Model").classes("text-subtitle2 q-mb-sm")
+                        initial_models = options["models_by_language"].get(
+                            language.value, []
                         )
-                    )
+                        initial_model = options["default_model_by_language"].get(
+                            language.value
+                        )
+                        if initial_model not in initial_models and initial_models:
+                            initial_model = initial_models[0]
+
+                        model = ui.select(
+                            initial_models,
+                            value=initial_model,
+                        ).classes("w-full")
+
+                    def on_language_change_update_model(e):
+                        models = options["models_by_language"].get(e.value, [])
+                        default_model = options["default_model_by_language"].get(e.value)
+                        if default_model not in models and models:
+                            default_model = models[0]
+
+                        model.set_options(models)
+                        model.value = default_model
+                        model.update()
+
+                    language.on_value_change(on_language_change_update_model)
 
                 with ui.column().classes("col-12 col-sm-24"):
                     ui.label("Number of speakers, automatic if not chosen").classes(
@@ -1144,9 +1258,14 @@ def table_transcribe(selected_row, on_complete=None) -> None:
                     "Start transcribing",
                     on_click=lambda: start_transcription(
                         [selected_row],
-                        f"{language.value} (verbatim)"
-                        if verbatim.value
-                        else language.value,
+                        resolve_language_and_model_selection(
+                            language.value,
+                            model.value if model else None,
+                        )[0],
+                        resolve_language_and_model_selection(
+                            language.value,
+                            model.value if model else None,
+                        )[1],
                         speakers.value,
                         output_format.value,
                         dialog,
@@ -1170,6 +1289,8 @@ def table_bulk_transcribe(table: ui.table, on_complete=None) -> None:
     if not uploadable:
         ui.notify("No uploaded files selected", type="warning", position="top")
         return
+
+    options = get_transcriber_options()
 
     with ui.dialog() as dialog:
         with (
@@ -1202,22 +1323,39 @@ def table_bulk_transcribe(table: ui.table, on_complete=None) -> None:
                 with ui.column().classes("col-12 col-sm-24"):
                     ui.label("Language").classes("text-subtitle2 q-mb-sm")
                     language = ui.select(
-                        settings.WHISPER_LANGUAGES,
-                        value=settings.WHISPER_LANGUAGES[0],
+                        options["languages"],
+                        value=options["languages"][0],
                     ).classes("w-full")
 
-                with ui.column().classes("col-12 col-sm-24") as verbatim_container:
-                    verbatim = ui.checkbox(
-                        "Verbatim (include filler words, repetitions and unfinished sentences)"
-                    ).classes("q-mt-sm")
-                    verbatim_container.set_visibility(
-                        language.value.lower() == "swedish"
-                    )
-                    language.on_value_change(
-                        lambda e: verbatim_container.set_visibility(
-                            e.value.lower() == "swedish"
+                model = None
+                if options["model_picker_enabled"]:
+                    with ui.column().classes("col-12 col-sm-24"):
+                        ui.label("Model").classes("text-subtitle2 q-mb-sm")
+                        initial_models = options["models_by_language"].get(
+                            language.value, []
                         )
-                    )
+                        initial_model = options["default_model_by_language"].get(
+                            language.value
+                        )
+                        if initial_model not in initial_models and initial_models:
+                            initial_model = initial_models[0]
+
+                        model = ui.select(
+                            initial_models,
+                            value=initial_model,
+                        ).classes("w-full")
+
+                    def on_language_change_update_model(e):
+                        models = options["models_by_language"].get(e.value, [])
+                        default_model = options["default_model_by_language"].get(e.value)
+                        if default_model not in models and models:
+                            default_model = models[0]
+
+                        model.set_options(models)
+                        model.value = default_model
+                        model.update()
+
+                    language.on_value_change(on_language_change_update_model)
 
                 with ui.column().classes("col-12 col-sm-24"):
                     ui.label("Number of speakers, automatic if not chosen").classes(
@@ -1247,18 +1385,21 @@ def table_bulk_transcribe(table: ui.table, on_complete=None) -> None:
 
                 with ui.button(
                     "Start transcribing",
-                    on_click=lambda: (
-                        start_transcription(
-                            uploadable,
-                            f"{language.value} (verbatim)"
-                            if verbatim.value
-                            else language.value,
-                            speakers.value,
-                            output_format.value,
-                            dialog,
-                            table,
-                            on_complete=on_complete,
-                        ),
+                    on_click=lambda: start_transcription(
+                        uploadable,
+                        resolve_language_and_model_selection(
+                            language.value,
+                            model.value if model else None,
+                        )[0],
+                        resolve_language_and_model_selection(
+                            language.value,
+                            model.value if model else None,
+                        )[1],
+                        speakers.value,
+                        output_format.value,
+                        dialog,
+                        table,
+                        on_complete=on_complete,
                     ),
                 ) as start:
                     start.props("color=black flat")
@@ -1425,6 +1566,7 @@ def table_bulk_export(table: ui.table) -> None:
 def start_transcription(
     rows: list,
     language: str,
+    model_type: str | None,
     speakers: str,
     output_format: str,
     dialog: ui.dialog,
@@ -1449,6 +1591,7 @@ def start_transcription(
                 f"{settings.API_URL}/api/v1/transcriber/{uuid}",
                 json={
                     "language": f"{selected_language}",
+                    "model_type": model_type,
                     "speakers": int(speakers),
                     "output_format": output_format,
                     "encryption_password": storage_decrypt(
@@ -1483,5 +1626,6 @@ def start_transcription(
         if table is not None:
             table.selected = []
         dialog.close()
-        if on_complete is not None:
+        ui.notify("Transcription started", type="positive", position="top")
+        if on_complete:
             on_complete()

@@ -47,8 +47,8 @@ class Settings(BaseSettings):
     LANDING_TEXT: str = "Welcome to Sunet Scribe"
 
     WHISPER_MODELS: list[str] = [
-        "Fast transcription (normal accuracy)",
-        "Slower transcription (higher accuracy)",
+        "fast transcription (normal accuracy)",
+        "slower transcription (higher accuracy)",
     ]
     WHISPER_LANGUAGES: list[str] = [
         "Swedish",
