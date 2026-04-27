@@ -16,7 +16,9 @@
 # limitations under the License.
 
 import asyncio
+import os
 import re
+import tempfile
 import httpx
 import pytz
 
@@ -34,7 +36,8 @@ from utils.token import (
 )
 from utils.helpers import storage_decrypt, customers_get
 
-MultiPartParser.spool_max_size = 1024 * 1024 * 4096
+MultiPartParser.spool_max_size = 1024 * 1024 * 16
+UPLOAD_COPY_CHUNK_SIZE = 1024 * 1024 * 8
 settings = get_settings()
 
 
@@ -856,20 +859,26 @@ def table_click(event) -> None:
         )
 
 
-async def post_file(filedata: bytes, filename: str) -> bool:
+async def post_file(file_path: str, filename: str) -> bool:
     """
-    Post a file to the API.
+    Stream a file from disk to the API without loading it into memory.
     """
-
-    files_json = {"file": (filename, filedata)}
 
     try:
         async with httpx.AsyncClient(timeout=900) as client:
-            response = await client.post(
-                f"{settings.API_URL}/api/v1/transcriber",
-                files=files_json,
-                headers=get_auth_header(),
-            )
+            with open(file_path, "rb") as upload_file:
+                response = await client.post(
+                    f"{settings.API_URL}/api/v1/transcriber",
+                    files={
+                        "file": (
+                            filename,
+                            upload_file,
+                            "application/octet-stream",
+                        )
+                    },
+                    headers=get_auth_header(),
+                )
+
             response.raise_for_status()
 
             if response.status_code != 200:
@@ -1031,42 +1040,73 @@ def table_upload(table) -> None:
 async def handle_upload_with_feedback(files, dialog, table):
     """
     Handle file uploads with user feedback and validation.
+
+    Files are copied to temporary files in chunks and then streamed to the
+    backend from disk. This avoids keeping multi-GB files in UI process memory.
     """
 
     client = ui.context.client
 
     dialog.close()
 
-    # Read file data while the client context is still active
     file_items = []
+
     for file in files.files:
         file_name = sanitize_filename(file.name)
-        file_data = await file.read()
-        file_items.append((file_name, file_data))
 
-    # Upload to backend in a background task so the UI stays responsive
+        temp_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            prefix="scribe-ui-upload-",
+            suffix=".upload",
+        )
+        temp_path = temp_file.name
+
+        try:
+            while True:
+                chunk = await file.read(UPLOAD_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                temp_file.write(chunk)
+
+            temp_file.close()
+            file_items.append((file_name, temp_path))
+        except Exception:
+            temp_file.close()
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
     async def _upload():
-        for file_name, file_data in file_items:
+        for file_name, temp_path in file_items:
             try:
-                await post_file(file_data, file_name)
+                success = await post_file(temp_path, file_name)
 
                 if not client._deleted:
-                    with table:
+                    if success:
                         ui.notify(
                             f"Successfully uploaded {file_name}",
                             type="positive",
                             timeout=3000,
                         )
-            except Exception as e:
-                if not client._deleted:
-                    with table:
+                    else:
                         ui.notify(
-                            f"Error uploading {file_name}: {str(e)}",
+                            f"Error uploading {file_name}",
                             type="negative",
                             timeout=5000,
                         )
+            except Exception as e:
+                if not client._deleted:
+                    ui.notify(
+                        f"Error uploading {file_name}: {str(e)}",
+                        type="negative",
+                        timeout=5000,
+                    )
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
         if not client._deleted:
+            await client.connected()
             table.update_rows(await jobs_get(), clear_selection=False)
 
     asyncio.create_task(_upload())
